@@ -14,10 +14,19 @@ import {
   Trash2,
   FolderArchive,
   FileDown,
-  X
+  X,
+  HelpCircle
 } from "lucide-react";
 import { PdfBlankPageInserter } from "@/utils/pdfProcessor";
+import { PDFDocument } from "pdf-lib";
 import JSZip from "jszip";
+
+interface FileItem {
+  file: File;
+  pageCount: number;
+  loading: boolean;
+  error: string | null;
+}
 
 interface ProcessedResultItem {
   id: string;
@@ -30,11 +39,12 @@ interface ProcessedResultItem {
 
 export default function Home() {
   // --- States ---
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useState<FileItem[]>([]);
   const [dragActive, setDragActive] = useState<boolean>(false);
   
   // Settings States
-  const [mode, setMode] = useState<"interval" | "specific">("interval");
+  // Chế độ: 'vnedu' (in 2 mặt thông minh), 'interval' (sau mỗi N trang), 'specific' (chọn trang cụ thể)
+  const [mode, setMode] = useState<"vnedu" | "interval" | "specific">("vnedu");
   const [intervalValue, setIntervalValue] = useState<number>(3);
   const [specificPagesInput, setSpecificPagesInput] = useState<string>("3, 5");
   const [pageSizeMode, setPageSizeMode] = useState<"same-as-previous" | "a4" | "letter">("same-as-previous");
@@ -95,8 +105,8 @@ export default function Home() {
     }
   };
 
-  // Xác minh định dạng PDF và gộp vào danh sách hàng đợi
-  const validateAndAddFiles = (selectedFiles: FileList | File[]) => {
+  // Xác minh định dạng PDF, đọc số trang tức thì và gộp vào hàng đợi
+  const validateAndAddFiles = async (selectedFiles: FileList | File[]) => {
     setErrorMsg(null);
     setProcessedResults([]);
     if (zipDownloadUrl) {
@@ -119,9 +129,51 @@ export default function Home() {
       setErrorMsg(`Bỏ qua ${invalidFiles.length} file không hợp lệ (chỉ hỗ trợ file PDF): ${invalidFiles.join(", ")}`);
     }
 
-    if (pdfList.length > 0) {
-      // Gộp các file PDF mới vào hàng đợi hiện có
-      setFiles((prev) => [...prev, ...pdfList]);
+    if (pdfList.length === 0) return;
+
+    // Tạo các item ở trạng thái loading trước
+    const newItems: FileItem[] = pdfList.map((f) => ({
+      file: f,
+      pageCount: 0,
+      loading: true,
+      error: null
+    }));
+
+    // Cập nhật hàng đợi hiển thị spinner
+    setFiles((prev) => [...prev, ...newItems]);
+
+    // Bất đồng bộ load từng file để trích xuất số trang tức thì
+    for (const item of newItems) {
+      try {
+        const buffer = await item.file.arrayBuffer();
+        const doc = await PDFDocument.load(buffer);
+        const pages = doc.getPageCount();
+
+        setFiles((prev) => 
+          prev.map((f) => 
+            f.file === item.file 
+              ? { ...f, pageCount: pages, loading: false } 
+              : f
+          )
+        );
+      } catch (err: any) {
+        const errMsg = err?.message || "";
+        const isEncrypted = errMsg.toLowerCase().includes("encrypted") || 
+                            errMsg.toLowerCase().includes("password") || 
+                            errMsg.toLowerCase().includes("decrypt");
+        
+        const friendlyError = isEncrypted
+          ? "File bị bảo vệ mật khẩu"
+          : "File PDF bị hỏng hoặc lỗi định dạng";
+
+        setFiles((prev) => 
+          prev.map((f) => 
+            f.file === item.file 
+              ? { ...f, error: friendlyError, loading: false } 
+              : f
+          )
+        );
+      }
     }
   };
 
@@ -156,14 +208,16 @@ export default function Home() {
 
   // --- LẦN LƯỢT XỬ LÝ DANH SÁCH FILE PDF (BATCH PROCESSING) ---
   const handleProcessPdfBatch = async () => {
-    if (files.length === 0) return;
+    // Chỉ xử lý các file không bị lỗi và đã load xong số trang
+    const validFiles = files.filter((f) => !f.loading && !f.error);
+    if (validFiles.length === 0) return;
 
     setProcessing(true);
     setProgress(5);
-    setProcessingStatus("Khởi động tiến trình xử lý hàng loạt...");
+    setProcessingStatus("Khởi động tiến trình xử lý...");
     setErrorMsg(null);
     
-    // Revoke các download url cũ
+    // Dọn dẹp Blob Url cũ
     if (zipDownloadUrl) {
       URL.revokeObjectURL(zipDownloadUrl);
       setZipDownloadUrl(null);
@@ -189,36 +243,67 @@ export default function Home() {
       }
 
       // Vòng lặp xử lý tuần tự từng file PDF trong danh sách
-      for (let idx = 0; idx < files.length; idx++) {
-        const fileItem = files[idx];
+      for (let idx = 0; idx < validFiles.length; idx++) {
+        const fileItem = validFiles[idx];
         const fileNum = idx + 1;
 
         // Cập nhật trạng thái
-        setProcessingStatus(`[File ${fileNum}/${files.length}] Đang xử lý: ${fileItem.name}...`);
+        setProcessingStatus(`[File ${fileNum}/${validFiles.length}] Đang xử lý: ${fileItem.file.name}...`);
         
         // Chia đều thanh tiến trình theo số lượng file
-        const fileProgressStart = Math.floor((idx / files.length) * 80) + 5;
+        const fileProgressStart = Math.floor((idx / validFiles.length) * 80) + 5;
         setProgress(fileProgressStart);
 
         // Chuyển file thành ArrayBuffer
-        const arrayBuffer = await fileItem.arrayBuffer();
+        const arrayBuffer = await fileItem.file.arrayBuffer();
 
         // Chạy bất đồng bộ một chút để UI kịp render trạng thái
         await new Promise((resolve) => setTimeout(resolve, 150));
 
-        // Gọi core xử lý PDF
-        const res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
-          mode,
-          intervalValue,
-          specificPages,
-          pageSizeMode,
-          insertAtEndIfRemainder
-        });
+        let res;
+
+        // Nếu ở chế độ vnEdu học bạ thông minh
+        if (mode === "vnedu") {
+          const studentPageSize = intervalValue;
+          const isOdd = studentPageSize % 2 !== 0;
+
+          if (isOdd) {
+            // Nếu số trang mỗi em là LẺ, tự động chèn trang trắng sau mỗi N trang
+            res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
+              mode: "interval",
+              intervalValue: studentPageSize,
+              pageSizeMode,
+              insertAtEndIfRemainder: true // Luôn chèn ở cuối học sinh cuối nếu lẻ trang
+            });
+          } else {
+            // Nếu số trang mỗi em là CHẴN, in hai mặt đã hoàn hảo, giữ nguyên file gốc
+            res = {
+              success: true,
+              code: 200,
+              message: "Giữ nguyên file gốc do số trang học sinh đã là số chẵn.",
+              data: {
+                pdfBytes: new Uint8Array(arrayBuffer),
+                originalPageCount: fileItem.pageCount,
+                newPageCount: fileItem.pageCount,
+                insertedPositions: []
+              }
+            };
+          }
+        } else {
+          // Các chế độ chèn thông thường
+          res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
+            mode,
+            intervalValue,
+            specificPages,
+            pageSizeMode,
+            insertAtEndIfRemainder
+          });
+        }
 
         if (res.success && res.data && res.data.pdfBytes) {
           const blob = new Blob([res.data.pdfBytes as any], { type: "application/pdf" });
           const downloadUrl = URL.createObjectURL(blob);
-          const newName = `${fileItem.name.replace(/\.[^/.]+$/, "")}_with_blanks.pdf`;
+          const newName = `${fileItem.file.name.replace(/\.[^/.]+$/, "")}_with_blanks.pdf`;
 
           newResults.push({
             id: `res-${idx}-${Date.now()}`,
@@ -232,14 +317,13 @@ export default function Home() {
           // Cho file đã xử lý vào ZIP
           zip.file(newName, res.data.pdfBytes);
         } else {
-          // Thất bại ở file nào thì ném lỗi ra trực quan
-          throw new Error(`Xử lý thất bại tại file: "${fileItem.name}". Chi tiết: ${res.message}`);
+          throw new Error(`Xử lý thất bại tại file: "${fileItem.file.name}". Chi tiết: ${res.message}`);
         }
       }
 
       // Đóng gói tất cả các file PDF thành 1 file ZIP duy nhất
       if (newResults.length > 0) {
-        setProcessingStatus("Đang đóng gói toàn bộ tài liệu thành file lưu trữ ZIP...");
+        setProcessingStatus("Đang nén tất cả các file đã xử lý thành định dạng ZIP...");
         setProgress(85);
         await new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -256,7 +340,6 @@ export default function Home() {
 
       setProcessing(false);
     } catch (err: any) {
-      // Dọn dẹp Blob Url nếu lỗi phát sinh
       newResults.forEach((r) => URL.revokeObjectURL(r.downloadUrl));
       setErrorMsg(err?.message || "Đã xảy ra lỗi trong quá trình xử lý hàng loạt.");
       setProcessing(false);
@@ -280,8 +363,8 @@ export default function Home() {
       <header>
         <h1>PDF Blank Page Inserter</h1>
         <p className="subtitle">
-          Công cụ cao cấp giúp chèn trang trắng hàng loạt vào **nhiều file PDF cùng lúc** trực tiếp trên trình duyệt. 
-          Bảo mật tuyệt đối – Dữ liệu của bạn không bao giờ rời khỏi thiết bị.
+          Công cụ chèn trang trắng tự động nhảy trang in 2 mặt cho học bạ vnEdu và tài liệu gộp hàng loạt trực tiếp trên trình duyệt. 
+          Bảo mật tuyệt đối – File của bạn không upload lên server.
         </p>
       </header>
 
@@ -309,10 +392,10 @@ export default function Home() {
             <FileUp size={32} />
           </div>
           <div className="dropzone-text">
-            <h3>Kéo & thả một hoặc nhiều file PDF vào đây</h3>
-            <p>hoặc nhấn để duyệt nhiều file từ máy tính</p>
+            <h3>Kéo & thả một hoặc nhiều file PDF Học bạ vào đây</h3>
+            <p>hoặc nhấn để duyệt file từ máy tính</p>
           </div>
-          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Chấp nhận nhiều file PDF cùng lúc</span>
+          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Hỗ trợ kéo thả đồng thời nhiều file PDF</span>
         </div>
 
         {/* --- DANH SÁCH FILE ĐANG CHỜ TRONG HÀNG ĐỢI --- */}
@@ -321,7 +404,7 @@ export default function Home() {
             <div className="file-list-header">
               <span className="file-list-title">Danh sách file đã chọn ({files.length})</span>
               <button className="clear-all-btn" onClick={handleClearAllFiles} type="button">
-                <Trash2 size={13} />
+                <Trash2 size={13} style={{ marginRight: "0.25rem" }} />
                 <span>Xóa tất cả</span>
               </button>
             </div>
@@ -330,21 +413,36 @@ export default function Home() {
               {files.map((fileItem, idx) => (
                 <div className="file-info-bar" key={`file-${idx}`} style={{ padding: "0.75rem 1.25rem" }}>
                   <div className="file-info-left">
-                    <div className="file-icon">
+                    <div className="file-icon" style={{ color: fileItem.error ? "var(--error)" : "#ef4444" }}>
                       <FileText size={22} />
                     </div>
                     <div className="file-meta">
-                      <div className="file-name" title={fileItem.name} style={{ fontSize: "0.85rem", maxWidth: "450px" }}>
-                        {fileItem.name}
+                      <div className="file-name" title={fileItem.file.name} style={{ fontSize: "0.85rem", maxWidth: "450px" }}>
+                        {fileItem.file.name}
                       </div>
-                      <div className="file-size" style={{ fontSize: "0.75rem" }}>{formatFileSize(fileItem.size)}</div>
+                      <div className="file-size" style={{ fontSize: "0.75rem" }}>
+                        {formatFileSize(fileItem.file.size)}
+                        {fileItem.loading && (
+                          <span style={{ color: "var(--primary)", marginLeft: "0.5rem" }}>• Đang phân tích số trang...</span>
+                        )}
+                        {!fileItem.loading && !fileItem.error && (
+                          <span style={{ color: "var(--success)", marginLeft: "0.5rem", fontWeight: 600 }}>
+                            • {fileItem.pageCount} trang
+                          </span>
+                        )}
+                        {fileItem.error && (
+                          <span style={{ color: "var(--error)", marginLeft: "0.5rem", fontWeight: 600 }}>
+                            • {fileItem.error}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
                   <button 
                     className="remove-file-btn" 
                     onClick={() => handleRemoveFile(idx)} 
                     title="Xóa khỏi danh sách"
-                    aria-label={`Xóa file ${fileItem.name}`}
+                    aria-label={`Xóa file ${fileItem.file.name}`}
                     type="button"
                   >
                     <X size={16} />
@@ -369,6 +467,75 @@ export default function Home() {
           </div>
         )}
 
+        {/* --- BẢNG PHÂN TÍCH IN 2 MẶT THÔNG MINH (CHUYÊN BIỆT CHO vnEdu HỌC BẠ) --- */}
+        {mode === "vnedu" && files.length > 0 && !processing && !zipDownloadUrl && (
+          <div className="config-card" style={{ border: "1px solid rgba(139, 92, 246, 0.25)", background: "rgba(139, 92, 246, 0.02)", animation: "fadeIn 0.5s ease-out" }} id="duplex-analysis-panel">
+            <div className="config-card-title">
+              <HelpCircle size={18} style={{ color: "var(--primary)" }} />
+              <span>Phân tích In 2 mặt Học bạ vnEdu</span>
+            </div>
+            
+            <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+              {files.map((fileItem, idx) => {
+                if (fileItem.loading) {
+                  return (
+                    <div key={`analysis-${idx}`} style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>
+                      🔄 Đang quét cấu trúc file <em>{fileItem.file.name}</em>...
+                    </div>
+                  );
+                }
+                if (fileItem.error) {
+                  return (
+                    <div key={`analysis-${idx}`} style={{ fontSize: "0.85rem", color: "var(--error)" }}>
+                      ❌ File <em>{fileItem.file.name}</em>: Không thể phân tích ({fileItem.error})
+                    </div>
+                  );
+                }
+
+                const pageCount = fileItem.pageCount;
+                const studentPageSize = intervalValue;
+                const remainder = pageCount % studentPageSize;
+                const studentsCount = Math.floor(pageCount / studentPageSize);
+                const isOdd = studentPageSize % 2 !== 0;
+
+                return (
+                  <div key={`analysis-${idx}`} style={{ display: "flex", flexDirection: "column", gap: "0.5rem", borderLeft: "2px solid rgba(255, 255, 255, 0.1)", paddingLeft: "1rem" }}>
+                    <div style={{ fontWeight: 600, fontSize: "0.9rem", color: "var(--text-primary)" }}>
+                      📄 {fileItem.file.name} ({pageCount} trang gốc)
+                    </div>
+                    
+                    {remainder === 0 ? (
+                      <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: "1.5" }}>
+                        <div>• Ước tính lớp có: <strong>{studentsCount} học sinh</strong> (mỗi em {studentPageSize} trang).</div>
+                        {isOdd ? (
+                          <div style={{ marginTop: "0.25rem" }}>
+                            <span style={{ color: "#fbbf24", fontWeight: 600 }}>⚠️ Cảnh báo Lẻ trang:</span> Mỗi em có {studentPageSize} trang (số lẻ). Khi in 2 mặt hàng loạt trực tiếp, học sinh sau sẽ bị in đè lên mặt sau của học sinh trước.
+                            <div style={{ color: "var(--success)", fontWeight: 600, marginTop: "0.25rem" }}>
+                              ✨ Giải pháp tự động: Hệ thống sẽ tự động chèn thêm 1 trang trắng sau mỗi học sinh (sau các trang {studentPageSize}, {studentPageSize * 2}, {studentPageSize * 3}...). Sau khi xử lý, mỗi học sinh có {studentPageSize + 1} trang (số chẵn), in 2 mặt tự động phân chia tờ hoàn hảo!
+                            </div>
+                          </div>
+                        ) : (
+                          <div style={{ marginTop: "0.25rem" }}>
+                            <span style={{ color: "var(--success)", fontWeight: 600 }}>🟢 Trạng thái Chẵn trang:</span> Mỗi em đã có {studentPageSize} trang (số chẵn). Khi in hai mặt sẽ tự động chiếm trọn vẹn {studentPageSize / 2} tờ giấy.
+                            <div style={{ color: "var(--text-muted)", marginTop: "0.25rem" }}>
+                              ✨ Đề xuất: Không cần chèn trang trắng. Hệ thống sẽ giữ nguyên file gốc tối ưu của học sinh.
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: "0.85rem", color: "#f87171", lineHeight: "1.5" }}>
+                        <span style={{ fontWeight: 600 }}>🔴 Cảnh báo lệch trang:</span> Tổng số trang gốc ({pageCount}) không chia hết cho số trang mỗi học sinh ({studentPageSize}). 
+                        <div>• Phát hiện có {studentsCount} học sinh đủ {studentPageSize} trang, và 1 học sinh cuối bị thiếu/thừa ({remainder} trang). Vui lòng kiểm tra lại file PDF gốc hoặc thiết lập số trang của học sinh.</div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* --- BẢNG CẤU HÌNH THÔNG SỐ CHÈN (HIỆN KHI CÓ FILE) --- */}
         {files.length > 0 && !processing && !zipDownloadUrl && (
           <div className="config-section" id="config-panel">
@@ -377,30 +544,54 @@ export default function Home() {
             <div className="config-card">
               <div className="config-card-title">
                 <Layers size={18} />
-                <span>Quy luật chèn trang trắng</span>
+                <span>Cấu hình Quy luật chèn</span>
               </div>
               
               <div className="form-group">
                 <label>Chế độ chèn trang</label>
                 <div className="tab-group">
                   <button 
+                    className={`tab-btn ${mode === "vnedu" ? "active" : ""}`}
+                    onClick={() => setMode("vnedu")}
+                    type="button"
+                  >
+                    Học bạ vnEdu (Nhảy trang)
+                  </button>
+                  <button 
                     className={`tab-btn ${mode === "interval" ? "active" : ""}`}
                     onClick={() => setMode("interval")}
                     type="button"
                   >
-                    Hàng loạt (Mỗi N trang)
+                    Mỗi N trang
                   </button>
                   <button 
                     className={`tab-btn ${mode === "specific" ? "active" : ""}`}
                     onClick={() => setMode("specific")}
                     type="button"
                   >
-                    Chọn số trang cụ thể
+                    Vị trí cụ thể
                   </button>
                 </div>
               </div>
 
-              {mode === "interval" ? (
+              {mode === "vnedu" && (
+                <div className="form-group">
+                  <label htmlFor="vnedu-input">Số trang học bạ gốc của mỗi học sinh</label>
+                  <input 
+                    id="vnedu-input"
+                    type="number" 
+                    min={1} 
+                    value={intervalValue} 
+                    onChange={(e) => setIntervalValue(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                    className="input-control"
+                  />
+                  <span className="input-help-text">
+                    Kiểm tra file học bạ vnEdu của bạn và nhập số trang của 1 học sinh (ví dụ: cấp tiểu học thường có 3 trang hoặc 5 trang).
+                  </span>
+                </div>
+              )}
+
+              {mode === "interval" && (
                 <div className="form-group">
                   <label htmlFor="interval-input">Khoảng cách chèn trang (N)</label>
                   <input 
@@ -412,10 +603,12 @@ export default function Home() {
                     className="input-control"
                   />
                   <span className="input-help-text">
-                    Ví dụ nhập số 3: Một trang trắng sẽ được tự động chèn sau trang số 3, 6, 9, 12... của tất cả các file gốc.
+                    Một trang trắng sẽ được tự động chèn sau trang số N, 2N, 3N, 4N... của tất cả các file PDF gốc.
                   </span>
                 </div>
-              ) : (
+              )}
+
+              {mode === "specific" && (
                 <div className="form-group">
                   <label htmlFor="specific-input">Chèn sau các trang thứ</label>
                   <input 
@@ -477,20 +670,30 @@ export default function Home() {
                   </label>
                 </div>
               )}
+
+              {mode === "vnedu" && (
+                <div style={{ padding: "0.5rem", borderRadius: "10px", background: "rgba(16, 185, 129, 0.03)", border: "1px solid rgba(16, 185, 129, 0.1)", fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: "1.4" }}>
+                  💡 <strong>Quy trình in 2 mặt học bạ:</strong> <br/>
+                  1. Tải lên file PDF gộp của lớp. <br/>
+                  2. Nhập số trang học bạ của 1 em (ví dụ: 3). <br/>
+                  3. Bấm chạy. Tải file kết quả về máy. <br/>
+                  4. Khi in bằng Adobe Reader, chọn chế độ **Print on both sides** (In hai mặt) &rarr; Học bạ sẽ tự động tách tờ riêng biệt cho từng em cực kỳ chuyên nghiệp!
+                </div>
+              )}
             </div>
 
           </div>
         )}
 
         {/* --- NÚT HÀNH ĐỘNG CHÍNH --- */}
-        {files.length > 0 && !processing && !zipDownloadUrl && (
+        {files.filter((f) => !f.loading && !f.error).length > 0 && !processing && !zipDownloadUrl && (
           <button 
             className="action-btn" 
             onClick={handleProcessPdfBatch}
             id="start-process-btn"
             type="button"
           >
-            <span>Thực hiện xử lý hàng loạt ({files.length} file)</span>
+            <span>Thực hiện xử lý in 2 mặt thông minh ({files.filter((f) => !f.loading && !f.error).length} file)</span>
             <ChevronRight size={18} />
           </button>
         )}
@@ -515,9 +718,9 @@ export default function Home() {
               <Check size={32} />
             </div>
             <div>
-              <h2 className="result-title">Đã xử lý hàng loạt thành công!</h2>
+              <h2 className="result-title">Đã xử lý in 2 mặt thành công!</h2>
               <p style={{ color: "var(--text-secondary)", fontSize: "0.9rem", marginTop: "0.5rem" }}>
-                Đã chèn trang trắng thành công cho tất cả **{processedResults.length} file PDF** trực tiếp trên trình duyệt.
+                Đã phân tích và tối ưu nhảy trang 2 mặt cho **{processedResults.length} file PDF** trực tiếp trên trình duyệt.
               </p>
             </div>
 
@@ -536,7 +739,7 @@ export default function Home() {
                       <div className="result-item-info">
                         <div className="result-item-name" title={resItem.fileName}>{resItem.fileName}</div>
                         <div className="result-item-meta">
-                          Gốc: {resItem.originalPageCount} trang | Mới: {resItem.newPageCount} trang (+{resItem.insertedCount})
+                          Gốc: {resItem.originalPageCount} trang | Mới: {resItem.newPageCount} trang (+{resItem.insertedCount} trang trắng)
                         </div>
                       </div>
                     </div>
