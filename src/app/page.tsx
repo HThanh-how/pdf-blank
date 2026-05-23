@@ -161,7 +161,11 @@ export default function Home() {
       const textContent = await page.getTextContent();
       const pageText = textContent.items.map((item: any) => item.str).join(" ");
       
-      if (pageText.toLowerCase().includes(keyword.toLowerCase())) {
+      // CHUẨN HÓA UNICODE DỰNG SẴN (NFC) giải quyết triệt để lỗi lệch mã Tiếng Việt
+      const normalizedText = pageText.normalize("NFC").toLowerCase();
+      const normalizedKeyword = keyword.normalize("NFC").toLowerCase();
+      
+      if (normalizedText.includes(normalizedKeyword)) {
         starts.push(i);
       }
     }
@@ -264,7 +268,7 @@ export default function Home() {
       try {
         const buffer = await item.file.arrayBuffer();
         
-        // 1. Lấy tổng số trang bằng pdf-lib (nhanh nhất)
+        // 1. Lấy tổng số trang bằng pdf-lib
         const doc = await PDFDocument.load(buffer);
         const pages = doc.getPageCount();
 
@@ -286,7 +290,7 @@ export default function Home() {
           )
         );
 
-        // Gợi ý cấu hình trang cố định phòng hờ
+        // Gợi ý cấu hình trang cố định
         const commonPageSizes = [3, 4, 5, 6];
         const divisors = commonPageSizes.filter((size) => pages % size === 0);
         if (divisors.length > 0) {
@@ -399,6 +403,11 @@ export default function Home() {
             // TỰ ĐỘNG NHẬN DIỆN CHỮ: Chèn trang trắng tại các vị trí lẻ trang đã quét được
             const insertPositions = fileItem.insertPositions;
             
+            // Xử lý Fallback: Nếu không tìm thấy bất kỳ trang phân chia nào (quét lỗi hoặc từ khóa sai)
+            if (fileItem.studentStarts.length <= 1) {
+              throw new Error(`Không quét được từ khóa "${vneduKeyword}" trong file: "${fileItem.file.name}". Vui lòng kiểm tra lại từ khóa lý lịch hoặc chuyển sang chế độ "Số trang cố định" và thực hiện lại.`);
+            }
+
             if (insertPositions.length > 0) {
               res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
                 mode: "specific",
@@ -663,42 +672,54 @@ export default function Home() {
                     {vneduMethod === "auto" ? (
                       /* HIỂN THỊ PHÂN TÍCH TỰ ĐỘNG QUA QUÉT CHỮ */
                       <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: "1.5" }}>
-                        <div>• Trích xuất thành công: Tìm thấy <strong>{starts.length} học sinh</strong> dựa trên từ khóa lý lịch độc bản <em>&quot;{vneduKeyword}&quot;</em>.</div>
                         
-                        {hasNhayTrang && (
-                          <div style={{ margin: "0.25rem 0", color: "#fbbf24", fontWeight: 600 }}>
-                            ⚠️ Phát hiện có học sinh bị nhảy trang! (Số trang mỗi học sinh không đồng đều, dao động từ {Math.min(...sizes)} đến {Math.max(...sizes)} trang).
-                          </div>
-                        )}
-
-                        <div style={{ margin: "0.5rem 0", background: "rgba(0,0,0,0.2)", padding: "0.5rem 0.75rem", borderRadius: "8px", maxHeight: "120px", overflowY: "auto" }}>
-                          <span style={{ fontSize: "0.75rem", fontWeight: 600, display: "block", marginBottom: "0.25rem", color: "var(--text-muted)" }}>
-                            Cấu trúc bù trang chi tiết:
-                          </span>
-                          {starts.map((startPage, index) => {
-                            const size = sizes[index];
-                            const isOdd = size % 2 !== 0;
-                            return (
-                              <div key={`student-${index}`} style={{ fontSize: "0.75rem", display: "flex", justifyContent: "space-between", padding: "0.15rem 0" }}>
-                                <span>Học sinh {index + 1}: Trang {startPage} &rarr; {startPage + size - 1} ({size} trang)</span>
-                                {isOdd ? (
-                                  <span style={{ color: "#fbbf24", fontWeight: 600 }}>Cần chèn +1 trang trắng sau trang {startPage + size - 1}</span>
-                                ) : (
-                                  <span style={{ color: "var(--success)", fontWeight: 600 }}>Đã tối ưu (Chẵn trang)</span>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-
-                        {inserts.length > 0 ? (
-                          <div style={{ color: "var(--success)", fontWeight: 600 }}>
-                            ✨ Thuật toán thông minh sẽ tự động chèn thêm {inserts.length} trang trắng vào đúng vị trí cuối phần học bạ của các em bị lẻ trang. Đảm bảo in 2 mặt nhảy trang chính xác 100%!
+                        {starts.length <= 1 ? (
+                          /* CẢNH BÁO KHI QUÉT THẤT BẠI - CHUYỂN DỰ PHÒNG */
+                          <div style={{ color: "#f87171", padding: "0.5rem", borderRadius: "8px", background: "rgba(239, 68, 68, 0.05)", border: "1px solid rgba(239, 68, 68, 0.15)" }}>
+                            ⚠️ <strong>Quét chữ thất bại:</strong> Không tìm thấy từ khóa lý lịch <strong>&quot;{vneduKeyword}&quot;</strong> trong file PDF này. <br/>
+                            &rarr; <em>Vui lòng kiểm tra lại từ khóa hoặc chuyển sang chế độ <strong>&quot;Số trang cố định&quot;</strong> để hệ thống tự động chia đều (ví dụ: nhập 3 trang mỗi em) và chèn chính xác 100%!</em>
                           </div>
                         ) : (
-                          <div style={{ color: "var(--success)", fontWeight: 600 }}>
-                            🟢 Tất cả các học sinh đều có số trang chẵn. in hai mặt đã tối ưu, không cần chèn thêm trang trắng!
-                          </div>
+                          /* QUÉT THÀNH CÔNG RỰC RỠ */
+                          <>
+                            <div>• Trích xuất thành công: Tìm thấy <strong>{starts.length} học sinh</strong> dựa trên từ khóa lý lịch độc bản <em>&quot;{vneduKeyword}&quot;</em>.</div>
+                            
+                            {hasNhayTrang && (
+                              <div style={{ margin: "0.25rem 0", color: "#fbbf24", fontWeight: 600 }}>
+                                ⚠️ Phát hiện có học sinh bị nhảy trang! (Số trang mỗi học sinh không đồng đều, dao động từ {Math.min(...sizes)} đến {Math.max(...sizes)} trang).
+                              </div>
+                            )}
+
+                            <div style={{ margin: "0.5rem 0", background: "rgba(0,0,0,0.2)", padding: "0.5rem 0.75rem", borderRadius: "8px", maxHeight: "120px", overflowY: "auto" }}>
+                              <span style={{ fontSize: "0.75rem", fontWeight: 600, display: "block", marginBottom: "0.25rem", color: "var(--text-muted)" }}>
+                                Cấu trúc bù trang chi tiết:
+                              </span>
+                              {starts.map((startPage, index) => {
+                                const size = sizes[index];
+                                const isOdd = size % 2 !== 0;
+                                return (
+                                  <div key={`student-${index}`} style={{ fontSize: "0.75rem", display: "flex", justifyContent: "space-between", padding: "0.15rem 0" }}>
+                                    <span>Học sinh {index + 1}: Trang {startPage} &rarr; {startPage + size - 1} ({size} trang)</span>
+                                    {isOdd ? (
+                                      <span style={{ color: "#fbbf24", fontWeight: 600 }}>Cần chèn +1 trang trắng sau trang {startPage + size - 1}</span>
+                                    ) : (
+                                      <span style={{ color: "var(--success)", fontWeight: 600 }}>Đã tối ưu (Chẵn trang)</span>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+
+                            {inserts.length > 0 ? (
+                              <div style={{ color: "var(--success)", fontWeight: 600 }}>
+                                ✨ Thuật toán thông minh sẽ tự động chèn thêm {inserts.length} trang trắng vào đúng vị trí cuối phần học bạ của các em bị lẻ trang (trang {inserts.join(", ")}). Đảm bảo in 2 mặt nhảy trang chính xác 100%!
+                              </div>
+                            ) : (
+                              <div style={{ color: "var(--success)", fontWeight: 600 }}>
+                                🟢 Tất cả các học sinh đều có số trang chẵn. in hai mặt đã tối ưu, không cần chèn thêm trang trắng!
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     ) : (
@@ -709,7 +730,7 @@ export default function Home() {
                           <div style={{ marginTop: "0.25rem" }}>
                             <span style={{ color: "#fbbf24", fontWeight: 600 }}>⚠️ Cảnh báo Lẻ trang:</span> Mỗi em có {intervalValue} trang (số lẻ). 
                             <div style={{ color: "var(--success)", fontWeight: 600, marginTop: "0.25rem" }}>
-                              ✨ Giải pháp: Hệ thống tự động chèn 1 trang trắng sau mỗi {intervalValue} trang.
+                              ✨ Giải pháp: Hệ thống tự động chèn 1 trang trắng sau mỗi {intervalValue} trang (sau các trang {Array.from({ length: Math.floor(fileItem.pageCount / intervalValue) }, (_, i) => (i + 1) * intervalValue).join(", ")}).
                             </div>
                           </div>
                         ) : (
