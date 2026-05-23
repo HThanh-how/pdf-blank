@@ -156,6 +156,13 @@ export default function Home() {
               : f
           )
         );
+
+        // --- TỰ ĐỘNG NHẬN DIỆN THÔNG MINH SỐ TRANG vnEdu HỌC BẠ (AUTO-DETECT) ---
+        const commonPageSizes = [3, 4, 5, 6];
+        const divisors = commonPageSizes.filter((size) => pages % size === 0);
+        if (divisors.length > 0) {
+          setIntervalValue(divisors[0]);
+        }
       } catch (err: any) {
         const errMsg = err?.message || "";
         const isEncrypted = errMsg.toLowerCase().includes("encrypted") || 
