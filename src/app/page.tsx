@@ -26,6 +26,10 @@ interface FileItem {
   pageCount: number;
   loading: boolean;
   error: string | null;
+  // Metadata quét text thông minh
+  studentStarts: number[]; // Vị trí các trang bắt đầu của từng học sinh (1-indexed)
+  studentSizes: number[]; // Số trang của từng học sinh tương ứng
+  insertPositions: number[]; // Vị trí cần chèn trang trắng (1-indexed dựa trên file gốc)
 }
 
 interface ProcessedResultItem {
@@ -37,6 +41,25 @@ interface ProcessedResultItem {
   downloadUrl: string;
 }
 
+// Hàm tải thư viện PDF.js từ CDN ở Client-side
+const loadPdfJS = (): Promise<any> => {
+  return new Promise((resolve, reject) => {
+    if (typeof window === "undefined") return reject("Chỉ chạy trên trình duyệt");
+    if ((window as any).pdfjsLib) {
+      return resolve((window as any).pdfjsLib);
+    }
+    const script = document.createElement("script");
+    script.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    script.onload = () => {
+      const pdfjsLib = (window as any).pdfjsLib;
+      pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      resolve(pdfjsLib);
+    };
+    script.onerror = () => reject("Không thể tải thư viện PDF.js quét text");
+    document.head.appendChild(script);
+  });
+};
+
 export default function Home() {
   // --- States ---
   const [files, setFiles] = useState<FileItem[]>([]);
@@ -45,6 +68,12 @@ export default function Home() {
   // Settings States
   // Chế độ: 'vnedu' (in 2 mặt thông minh), 'interval' (sau mỗi N trang), 'specific' (chọn trang cụ thể)
   const [mode, setMode] = useState<"vnedu" | "interval" | "specific">("vnedu");
+  
+  // vnEdu Smart Settings
+  const [vneduMethod, setVneduMethod] = useState<"auto" | "fixed">("auto"); // auto: Quét từ khóa quét chữ, fixed: số trang cố định
+  const [vneduKeyword, setVneduKeyword] = useState<string>("Họ và tên học sinh"); // Từ khóa nhận biết trang đầu
+  
+  // Chế độ thông thường
   const [intervalValue, setIntervalValue] = useState<number>(3);
   const [specificPagesInput, setSpecificPagesInput] = useState<string>("3, 5");
   const [pageSizeMode, setPageSizeMode] = useState<"same-as-previous" | "a4" | "letter">("same-as-previous");
@@ -62,7 +91,7 @@ export default function Home() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Dọn dẹp các Blob URL tránh rò rỉ bộ nhớ
+  // Dọn dẹp Blob URL
   useEffect(() => {
     return () => {
       if (zipDownloadUrl) {
@@ -76,9 +105,95 @@ export default function Home() {
     };
   }, [zipDownloadUrl, processedResults]);
 
+  // Quét lại phân tích học bạ khi từ khóa thay đổi
+  useEffect(() => {
+    if (mode === "vnedu" && vneduMethod === "auto" && files.length > 0) {
+      // Re-trigger phân tích thông minh cho các file hiện tại
+      const reAnalyze = async () => {
+        const updatedFiles = [...files];
+        let hasChange = false;
+
+        for (let i = 0; i < updatedFiles.length; i++) {
+          const item = updatedFiles[i];
+          if (!item.loading && !item.error) {
+            try {
+              const buffer = await item.file.arrayBuffer();
+              const analysis = await analyzePdfText(buffer, item.pageCount, vneduKeyword);
+              updatedFiles[i] = {
+                ...item,
+                studentStarts: analysis.starts,
+                studentSizes: analysis.sizes,
+                insertPositions: analysis.inserts
+              };
+              hasChange = true;
+            } catch (e) {
+              console.error("Lỗi phân tích lại file", e);
+            }
+          }
+        }
+
+        if (hasChange) {
+          setFiles(updatedFiles);
+        }
+      };
+      
+      reAnalyze();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vneduKeyword, vneduMethod, mode]);
+
+  // --- Hàm quét chữ trích xuất text từng trang để tìm điểm phân chia học sinh ---
+  const analyzePdfText = async (
+    arrayBuffer: ArrayBuffer, 
+    pageCount: number, 
+    keyword: string
+  ): Promise<{ starts: number[]; sizes: number[]; inserts: number[] }> => {
+    const pdfjsLib = await loadPdfJS();
+    
+    // Load file bằng PDF.js CDN
+    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) });
+    const pdfDoc = await loadingTask.promise;
+    
+    const starts: number[] = [];
+    
+    // 1. Quét tìm tất cả các trang chứa từ khóa
+    for (let i = 1; i <= pageCount; i++) {
+      const page = await pdfDoc.getPage(i);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items.map((item: any) => item.str).join(" ");
+      
+      if (pageText.toLowerCase().includes(keyword.toLowerCase())) {
+        starts.push(i);
+      }
+    }
+
+    // Đảm bảo học sinh đầu tiên bắt đầu từ trang 1
+    if (starts.length === 0 || starts[0] !== 1) {
+      starts.unshift(1);
+    }
+
+    // 2. Tính toán số trang của từng học sinh
+    const sizes: number[] = [];
+    const inserts: number[] = [];
+
+    for (let i = 0; i < starts.length; i++) {
+      const start = starts[i];
+      // Học sinh tiếp theo bắt đầu ở starts[i+1], hoặc nếu là em cuối cùng thì kết thúc ở trang cuối pageCount
+      const end = (i < starts.length - 1) ? starts[i + 1] - 1 : pageCount;
+      const size = end - start + 1;
+      
+      sizes.push(size);
+
+      // Nếu số trang của học sinh này là số lẻ, chèn trang trắng sau trang cuối (end) của em đó
+      if (size % 2 !== 0) {
+        inserts.push(end);
+      }
+    }
+
+    return { starts, sizes, inserts };
+  };
+
   // --- Handlers ---
-  
-  // Xử lý kéo thả file
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
@@ -105,7 +220,7 @@ export default function Home() {
     }
   };
 
-  // Xác minh định dạng PDF, đọc số trang tức thì và gộp vào hàng đợi
+  // Xác minh định dạng PDF, đọc số trang tức thì, quét chữ thông minh và gộp vào hàng đợi
   const validateAndAddFiles = async (selectedFiles: FileList | File[]) => {
     setErrorMsg(null);
     setProcessedResults([]);
@@ -131,37 +246,54 @@ export default function Home() {
 
     if (pdfList.length === 0) return;
 
-    // Tạo các item ở trạng thái loading trước
+    // Tạo các item ở trạng thái loading
     const newItems: FileItem[] = pdfList.map((f) => ({
       file: f,
       pageCount: 0,
       loading: true,
-      error: null
+      error: null,
+      studentStarts: [],
+      studentSizes: [],
+      insertPositions: []
     }));
 
     // Cập nhật hàng đợi hiển thị spinner
     setFiles((prev) => [...prev, ...newItems]);
 
-    // Bất đồng bộ load từng file để trích xuất số trang tức thì
+    // Bất đồng bộ load từng file để trích xuất số trang & quét text thông minh
     for (const item of newItems) {
       try {
         const buffer = await item.file.arrayBuffer();
+        
+        // 1. Lấy tổng số trang bằng pdf-lib (nhanh nhất)
         const doc = await PDFDocument.load(buffer);
         const pages = doc.getPageCount();
+
+        // 2. Chạy quét text thông minh bằng PDF.js CDN để phân tích cấu trúc học sinh
+        const textAnalysis = await analyzePdfText(buffer, pages, vneduKeyword);
 
         setFiles((prev) => 
           prev.map((f) => 
             f.file === item.file 
-              ? { ...f, pageCount: pages, loading: false } 
+              ? { 
+                  ...f, 
+                  pageCount: pages, 
+                  studentStarts: textAnalysis.starts,
+                  studentSizes: textAnalysis.sizes,
+                  insertPositions: textAnalysis.inserts,
+                  loading: false 
+                } 
               : f
           )
         );
 
-        // --- TỰ ĐỘNG NHẬN DIỆN THÔNG MINH SỐ TRANG vnEdu HỌC BẠ (AUTO-DETECT) ---
-        const commonPageSizes = [3, 4, 5, 6];
-        const divisors = commonPageSizes.filter((size) => pages % size === 0);
-        if (divisors.length > 0) {
-          setIntervalValue(divisors[0]);
+        // --- TỰ ĐỘNG GỢI Ý CẤU HÌNH TRANG CỐ ĐỊNH (PHÒNG HỜ KHI BẬT FIXED) ---
+        if (vneduMethod === "fixed") {
+          const commonPageSizes = [3, 4, 5, 6];
+          const divisors = commonPageSizes.filter((size) => pages % size === 0);
+          if (divisors.length > 0) {
+            setIntervalValue(divisors[0]);
+          }
         }
       } catch (err: any) {
         const errMsg = err?.message || "";
@@ -215,13 +347,12 @@ export default function Home() {
 
   // --- LẦN LƯỢT XỬ LÝ DANH SÁCH FILE PDF (BATCH PROCESSING) ---
   const handleProcessPdfBatch = async () => {
-    // Chỉ xử lý các file không bị lỗi và đã load xong số trang
     const validFiles = files.filter((f) => !f.loading && !f.error);
     if (validFiles.length === 0) return;
 
     setProcessing(true);
     setProgress(5);
-    setProcessingStatus("Khởi động tiến trình xử lý...");
+    setProcessingStatus("Khởi động tiến trình xử lý hàng loạt...");
     setErrorMsg(null);
     
     // Dọn dẹp Blob Url cũ
@@ -236,7 +367,7 @@ export default function Home() {
     const zip = new JSZip();
 
     try {
-      // Phân tích trang chỉ định nếu dùng chế độ 'specific'
+      // Phân tích các chế độ in
       let specificPages: number[] = [];
       if (mode === "specific") {
         specificPages = specificPagesInput
@@ -254,50 +385,71 @@ export default function Home() {
         const fileItem = validFiles[idx];
         const fileNum = idx + 1;
 
-        // Cập nhật trạng thái
         setProcessingStatus(`[File ${fileNum}/${validFiles.length}] Đang xử lý: ${fileItem.file.name}...`);
         
         // Chia đều thanh tiến trình theo số lượng file
         const fileProgressStart = Math.floor((idx / validFiles.length) * 80) + 5;
         setProgress(fileProgressStart);
 
-        // Chuyển file thành ArrayBuffer
         const arrayBuffer = await fileItem.file.arrayBuffer();
-
-        // Chạy bất đồng bộ một chút để UI kịp render trạng thái
         await new Promise((resolve) => setTimeout(resolve, 150));
 
         let res;
 
-        // Nếu ở chế độ vnEdu học bạ thông minh
+        // --- CHẾ ĐỘ 1: vnEdu HỌC BẠ / IN 2 MẶT THÔNG MINH ---
         if (mode === "vnedu") {
-          const studentPageSize = intervalValue;
-          const isOdd = studentPageSize % 2 !== 0;
-
-          if (isOdd) {
-            // Nếu số trang mỗi em là LẺ, tự động chèn trang trắng sau mỗi N trang
-            res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
-              mode: "interval",
-              intervalValue: studentPageSize,
-              pageSizeMode,
-              insertAtEndIfRemainder: true // Luôn chèn ở cuối học sinh cuối nếu lẻ trang
-            });
+          if (vneduMethod === "auto") {
+            // TỰ ĐỘNG NHẬN DIỆN CHỮ: Chèn trang trắng tại các vị trí lẻ trang đã quét được
+            const insertPositions = fileItem.insertPositions;
+            
+            if (insertPositions.length > 0) {
+              res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
+                mode: "specific",
+                specificPages: insertPositions,
+                pageSizeMode
+              });
+            } else {
+              // Mọi học sinh đều có số trang chẵn, giữ nguyên file gốc
+              res = {
+                success: true,
+                code: 200,
+                message: "Tất cả học sinh đều có số trang chẵn. Giữ nguyên file gốc.",
+                data: {
+                  pdfBytes: new Uint8Array(arrayBuffer),
+                  originalPageCount: fileItem.pageCount,
+                  newPageCount: fileItem.pageCount,
+                  insertedPositions: []
+                }
+              };
+            }
           } else {
-            // Nếu số trang mỗi em là CHẴN, in hai mặt đã hoàn hảo, giữ nguyên file gốc
-            res = {
-              success: true,
-              code: 200,
-              message: "Giữ nguyên file gốc do số trang học sinh đã là số chẵn.",
-              data: {
-                pdfBytes: new Uint8Array(arrayBuffer),
-                originalPageCount: fileItem.pageCount,
-                newPageCount: fileItem.pageCount,
-                insertedPositions: []
-              }
-            };
+            // CHIA TRANG CỐ ĐỊNH (FIXED METHOD)
+            const studentPageSize = intervalValue;
+            const isOdd = studentPageSize % 2 !== 0;
+
+            if (isOdd) {
+              res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
+                mode: "interval",
+                intervalValue: studentPageSize,
+                pageSizeMode,
+                insertAtEndIfRemainder: true
+              });
+            } else {
+              res = {
+                success: true,
+                code: 200,
+                message: "Giữ nguyên file gốc do cấu hình số trang học sinh đã là số chẵn.",
+                data: {
+                  pdfBytes: new Uint8Array(arrayBuffer),
+                  originalPageCount: fileItem.pageCount,
+                  newPageCount: fileItem.pageCount,
+                  insertedPositions: []
+                }
+              };
+            }
           }
         } else {
-          // Các chế độ chèn thông thường
+          // --- CHẾ ĐỘ THÔNG THƯỜNG ---
           res = await PdfBlankPageInserter.insertBlankPages(arrayBuffer, {
             mode,
             intervalValue,
@@ -321,16 +473,15 @@ export default function Home() {
             downloadUrl
           });
 
-          // Cho file đã xử lý vào ZIP
           zip.file(newName, res.data.pdfBytes);
         } else {
           throw new Error(`Xử lý thất bại tại file: "${fileItem.file.name}". Chi tiết: ${res.message}`);
         }
       }
 
-      // Đóng gói tất cả các file PDF thành 1 file ZIP duy nhất
+      // Đóng gói thành file ZIP
       if (newResults.length > 0) {
-        setProcessingStatus("Đang nén tất cả các file đã xử lý thành định dạng ZIP...");
+        setProcessingStatus("Đang đóng gói và nén tất cả các file thành định dạng ZIP...");
         setProgress(85);
         await new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -370,8 +521,8 @@ export default function Home() {
       <header>
         <h1>PDF Blank Page Inserter</h1>
         <p className="subtitle">
-          Công cụ chèn trang trắng tự động nhảy trang in 2 mặt cho học bạ vnEdu và tài liệu gộp hàng loạt trực tiếp trên trình duyệt. 
-          Bảo mật tuyệt đối – File của bạn không upload lên server.
+          Công cụ tự động nhận diện và bù trang trắng in 2 mặt cho học bạ vnEdu cực kỳ khôn ngoan, kể cả khi học sinh bị nhảy trang. 
+          Bảo mật 100% – Chạy trực tiếp trên trình duyệt.
         </p>
       </header>
 
@@ -402,7 +553,7 @@ export default function Home() {
             <h3>Kéo & thả một hoặc nhiều file PDF Học bạ vào đây</h3>
             <p>hoặc nhấn để duyệt file từ máy tính</p>
           </div>
-          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Hỗ trợ kéo thả đồng thời nhiều file PDF</span>
+          <span style={{ fontSize: "0.75rem", color: "var(--text-muted)" }}>Hỗ trợ xử lý song song nhiều file PDF</span>
         </div>
 
         {/* --- DANH SÁCH FILE ĐANG CHỜ TRONG HÀNG ĐỢI --- */}
@@ -430,11 +581,13 @@ export default function Home() {
                       <div className="file-size" style={{ fontSize: "0.75rem" }}>
                         {formatFileSize(fileItem.file.size)}
                         {fileItem.loading && (
-                          <span style={{ color: "var(--primary)", marginLeft: "0.5rem" }}>• Đang phân tích số trang...</span>
+                          <span style={{ color: "var(--primary)", marginLeft: "0.5rem" }}>
+                            • 🔄 Đang quét chữ nhận diện học sinh...
+                          </span>
                         )}
                         {!fileItem.loading && !fileItem.error && (
                           <span style={{ color: "var(--success)", marginLeft: "0.5rem", fontWeight: 600 }}>
-                            • {fileItem.pageCount} trang
+                            • {fileItem.pageCount} trang gốc • Tìm thấy {fileItem.studentStarts.length} học sinh
                           </span>
                         )}
                         {fileItem.error && (
@@ -479,7 +632,7 @@ export default function Home() {
           <div className="config-card" style={{ border: "1px solid rgba(139, 92, 246, 0.25)", background: "rgba(139, 92, 246, 0.02)", animation: "fadeIn 0.5s ease-out" }} id="duplex-analysis-panel">
             <div className="config-card-title">
               <HelpCircle size={18} style={{ color: "var(--primary)" }} />
-              <span>Phân tích In 2 mặt Học bạ vnEdu</span>
+              <span>Bảng phân tích in ấn 2 mặt thông minh</span>
             </div>
             
             <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
@@ -487,7 +640,7 @@ export default function Home() {
                 if (fileItem.loading) {
                   return (
                     <div key={`analysis-${idx}`} style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>
-                      🔄 Đang quét cấu trúc file <em>{fileItem.file.name}</em>...
+                      🔄 Đang quét chữ tìm điểm bắt đầu của từng em trong file <em>{fileItem.file.name}</em>...
                     </div>
                   );
                 }
@@ -499,41 +652,74 @@ export default function Home() {
                   );
                 }
 
-                const pageCount = fileItem.pageCount;
-                const studentPageSize = intervalValue;
-                const remainder = pageCount % studentPageSize;
-                const studentsCount = Math.floor(pageCount / studentPageSize);
-                const isOdd = studentPageSize % 2 !== 0;
+                const starts = fileItem.studentStarts;
+                const sizes = fileItem.studentSizes;
+                const inserts = fileItem.insertPositions;
+                const hasNhayTrang = sizes.some((s, i) => i > 0 && s !== sizes[0]);
 
                 return (
                   <div key={`analysis-${idx}`} style={{ display: "flex", flexDirection: "column", gap: "0.5rem", borderLeft: "2px solid rgba(255, 255, 255, 0.1)", paddingLeft: "1rem" }}>
                     <div style={{ fontWeight: 600, fontSize: "0.9rem", color: "var(--text-primary)" }}>
-                      📄 {fileItem.file.name} ({pageCount} trang gốc)
+                      📄 {fileItem.file.name} ({fileItem.pageCount} trang gốc)
                     </div>
                     
-                    {remainder === 0 ? (
+                    {vneduMethod === "auto" ? (
+                      /* HIỂN THỊ PHÂN TÍCH TỰ ĐỘNG QUA QUÉT CHỮ */
                       <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: "1.5" }}>
-                        <div>• Ước tính lớp có: <strong>{studentsCount} học sinh</strong> (mỗi em {studentPageSize} trang).</div>
-                        {isOdd ? (
-                          <div style={{ marginTop: "0.25rem" }}>
-                            <span style={{ color: "#fbbf24", fontWeight: 600 }}>⚠️ Cảnh báo Lẻ trang:</span> Mỗi em có {studentPageSize} trang (số lẻ). Khi in 2 mặt hàng loạt trực tiếp, học sinh sau sẽ bị in đè lên mặt sau của học sinh trước.
-                            <div style={{ color: "var(--success)", fontWeight: 600, marginTop: "0.25rem" }}>
-                              ✨ Giải pháp tự động: Hệ thống sẽ tự động chèn thêm 1 trang trắng sau mỗi học sinh (sau các trang {studentPageSize}, {studentPageSize * 2}, {studentPageSize * 3}...). Sau khi xử lý, mỗi học sinh có {studentPageSize + 1} trang (số chẵn), in 2 mặt tự động phân chia tờ hoàn hảo!
-                            </div>
+                        <div>• Trích xuất thành công: Tìm thấy <strong>{starts.length} học sinh</strong> dựa trên từ khóa lý lịch <em>&quot;{vneduKeyword}&quot;</em>.</div>
+                        
+                        {hasNhayTrang && (
+                          <div style={{ margin: "0.25rem 0", color: "#fbbf24", fontWeight: 600 }}>
+                            ⚠️ Phát hiện có học sinh bị nhảy trang! (Số trang mỗi học sinh không đồng đều, dao động từ {Math.min(...sizes)} đến {Math.max(...sizes)} trang).
+                          </div>
+                        )}
+
+                        <div style={{ margin: "0.5rem 0", background: "rgba(0,0,0,0.2)", padding: "0.5rem 0.75rem", borderRadius: "8px", maxHeight: "120px", overflowY: "auto" }}>
+                          <span style={{ fontSize: "0.75rem", fontWeight: 600, display: "block", marginBottom: "0.25rem", color: "var(--text-muted)" }}>
+                            Cấu trúc bù trang chi tiết:
+                          </span>
+                          {starts.map((startPage, index) => {
+                            const size = sizes[index];
+                            const isOdd = size % 2 !== 0;
+                            return (
+                              <div key={`student-${index}`} style={{ fontSize: "0.75rem", display: "flex", justifyContent: "space-between", padding: "0.15rem 0" }}>
+                                <span>Học sinh {index + 1}: Trang {startPage} &rarr; {startPage + size - 1} ({size} trang)</span>
+                                {isOdd ? (
+                                  <span style={{ color: "#fbbf24", fontWeight: 600 }}>Cần chèn +1 trang trắng</span>
+                                ) : (
+                                  <span style={{ color: "var(--success)", fontWeight: 600 }}>Đã tối ưu (Chẵn trang)</span>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {inserts.length > 0 ? (
+                          <div style={{ color: "var(--success)", fontWeight: 600 }}>
+                            ✨ Thuật toán thông minh sẽ tự động chèn thêm {inserts.length} trang trắng vào đúng vị trí cuối phần học bạ của các em bị lẻ trang. Đảm bảo in 2 mặt nhảy trang chính xác 100%!
                           </div>
                         ) : (
-                          <div style={{ marginTop: "0.25rem" }}>
-                            <span style={{ color: "var(--success)", fontWeight: 600 }}>🟢 Trạng thái Chẵn trang:</span> Mỗi em đã có {studentPageSize} trang (số chẵn). Khi in hai mặt sẽ tự động chiếm trọn vẹn {studentPageSize / 2} tờ giấy.
-                            <div style={{ color: "var(--text-muted)", marginTop: "0.25rem" }}>
-                              ✨ Đề xuất: Không cần chèn trang trắng. Hệ thống sẽ giữ nguyên file gốc tối ưu của học sinh.
-                            </div>
+                          <div style={{ color: "var(--success)", fontWeight: 600 }}>
+                            🟢 Tất cả các học sinh đều có số trang chẵn. in hai mặt đã tối ưu, không cần chèn thêm trang trắng!
                           </div>
                         )}
                       </div>
                     ) : (
-                      <div style={{ fontSize: "0.85rem", color: "#f87171", lineHeight: "1.5" }}>
-                        <span style={{ fontWeight: 600 }}>🔴 Cảnh báo lệch trang:</span> Tổng số trang gốc ({pageCount}) không chia hết cho số trang mỗi học sinh ({studentPageSize}). 
-                        <div>• Phát hiện có {studentsCount} học sinh đủ {studentPageSize} trang, và 1 học sinh cuối bị thiếu/thừa ({remainder} trang). Vui lòng kiểm tra lại file PDF gốc hoặc thiết lập số trang của học sinh.</div>
+                      /* HIỂN THỊ PHÂN TÍCH CHIA ĐỀU CỐ ĐỊNH */
+                      <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: "1.5" }}>
+                        <div>• Ước tính lớp có: <strong>{Math.floor(fileItem.pageCount / intervalValue)} học sinh</strong> (mỗi em {intervalValue} trang).</div>
+                        {intervalValue % 2 !== 0 ? (
+                          <div style={{ marginTop: "0.25rem" }}>
+                            <span style={{ color: "#fbbf24", fontWeight: 600 }}>⚠️ Cảnh báo Lẻ trang:</span> Mỗi em có {intervalValue} trang (số lẻ). 
+                            <div style={{ color: "var(--success)", fontWeight: 600, marginTop: "0.25rem" }}>
+                              ✨ Giải pháp: Hệ thống tự động chèn 1 trang trắng sau mỗi {intervalValue} trang.
+                            </div>
+                          </div>
+                        ) : (
+                          <div style={{ marginTop: "0.25rem" }}>
+                            <span style={{ color: "var(--success)", fontWeight: 600 }}>🟢 Trạng thái Chẵn trang:</span> Mỗi em đã có {intervalValue} trang (số chẵn).
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -581,21 +767,64 @@ export default function Home() {
                 </div>
               </div>
 
+              {/* CẤU HÌNH CHO vnEdu SMART MODE */}
               {mode === "vnedu" && (
-                <div className="form-group">
-                  <label htmlFor="vnedu-input">Số trang học bạ gốc của mỗi học sinh</label>
-                  <input 
-                    id="vnedu-input"
-                    type="number" 
-                    min={1} 
-                    value={intervalValue} 
-                    onChange={(e) => setIntervalValue(Math.max(1, parseInt(e.target.value, 10) || 1))}
-                    className="input-control"
-                  />
-                  <span className="input-help-text">
-                    Kiểm tra file học bạ vnEdu của bạn và nhập số trang của 1 học sinh (ví dụ: cấp tiểu học thường có 3 trang hoặc 5 trang).
-                  </span>
-                </div>
+                <>
+                  <div className="form-group">
+                    <label>Phương pháp nhận diện điểm phân chia học sinh</label>
+                    <div className="tab-group">
+                      <button 
+                        className={`tab-btn ${vneduMethod === "auto" ? "active" : ""}`}
+                        onClick={() => setVneduMethod("auto")}
+                        type="button"
+                      >
+                        Quét chữ tự động (AI Auto)
+                      </button>
+                      <button 
+                        className={`tab-btn ${vneduMethod === "fixed" ? "active" : ""}`}
+                        onClick={() => setVneduMethod("fixed")}
+                        type="button"
+                      >
+                        Số trang cố định
+                      </button>
+                    </div>
+                  </div>
+
+                  {vneduMethod === "auto" ? (
+                    <div className="form-group">
+                      <label htmlFor="keyword-select">Từ khóa nhận diện trang bìa học sinh mới</label>
+                      <select 
+                        id="keyword-select"
+                        value={vneduKeyword} 
+                        onChange={(e) => setVneduKeyword(e.target.value)}
+                        className="input-control"
+                      >
+                        <option value="Họ và tên học sinh">Họ và tên học sinh (vnEdu chuẩn)</option>
+                        <option value="Nam, nữ:">Nam, nữ: (Lý lịch học sinh)</option>
+                        <option value="HỌC BẠ">HỌC BẠ (Trang bìa lớn)</option>
+                        <option value="Trang 1/">Trang 1/ (Ký hiệu trang)</option>
+                      </select>
+                      <span className="input-help-text">
+                        Hệ thống sẽ quét từng trang PDF, trang nào có chứa từ khóa này sẽ được định vị là trang bắt đầu của một học sinh mới.
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="form-group">
+                      <label htmlFor="vnedu-input">Số trang học bạ gốc của mỗi học sinh</label>
+                      <input 
+                        id="vnedu-input"
+                        type="number" 
+                        min={1} 
+                        value={intervalValue} 
+                        onChange={(e) => setIntervalValue(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                        className="input-control"
+                      />
+                      <span className="input-help-text">
+                        Thích hợp khi tất cả học sinh đều tăm tắp có cùng số trang (ví dụ tất cả đều 3 trang).
+                      </span>
+                    </div>
+                  )}
+                </>
               )}
 
               {mode === "interval" && (
@@ -680,11 +909,10 @@ export default function Home() {
 
               {mode === "vnedu" && (
                 <div style={{ padding: "0.5rem", borderRadius: "10px", background: "rgba(16, 185, 129, 0.03)", border: "1px solid rgba(16, 185, 129, 0.1)", fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: "1.4" }}>
-                  💡 <strong>Quy trình in 2 mặt học bạ:</strong> <br/>
-                  1. Tải lên file PDF gộp của lớp. <br/>
-                  2. Nhập số trang học bạ của 1 em (ví dụ: 3). <br/>
-                  3. Bấm chạy. Tải file kết quả về máy. <br/>
-                  4. Khi in bằng Adobe Reader, chọn chế độ **Print on both sides** (In hai mặt) &rarr; Học bạ sẽ tự động tách tờ riêng biệt cho từng em cực kỳ chuyên nghiệp!
+                  💡 <strong>Tại sao AI Auto-detect khôn hơn?</strong> <br/>
+                  * Quét và đọc text thực tế của từng trang PDF. <br/>
+                  * Tự động nhận diện ranh giới từng học sinh kể cả khi có học sinh bị nhảy trang (em 3 trang, em 4 trang, em 5 trang...). <br/>
+                  * Tự động tính chẵn lẻ của riêng học sinh đó để chèn trang trắng bù vào cuối em đó chuẩn 100%, không lo lệch in ấn hàng loạt!
                 </div>
               )}
             </div>
@@ -727,7 +955,7 @@ export default function Home() {
             <div>
               <h2 className="result-title">Đã xử lý in 2 mặt thành công!</h2>
               <p style={{ color: "var(--text-secondary)", fontSize: "0.9rem", marginTop: "0.5rem" }}>
-                Đã phân tích và tối ưu nhảy trang 2 mặt cho **{processedResults.length} file PDF** trực tiếp trên trình duyệt.
+                Đã quét chữ thông minh và tối ưu bù trang 2 mặt cho **{processedResults.length} file PDF** trực tiếp trên trình duyệt.
               </p>
             </div>
 
