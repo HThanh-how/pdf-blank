@@ -71,7 +71,7 @@ export default function Home() {
   
   // vnEdu Smart Settings
   const [vneduMethod, setVneduMethod] = useState<"auto" | "fixed">("auto"); // auto: Quét từ khóa quét chữ, fixed: số trang cố định
-  const [vneduKeyword, setVneduKeyword] = useState<string>("Họ và tên học sinh"); // Từ khóa nhận biết trang đầu
+  const [vneduKeyword, setVneduKeyword] = useState<string>("Quê quán"); // Từ khóa nhận biết trang lý lịch đầu tiên của mỗi học sinh
   
   // Chế độ thông thường
   const [intervalValue, setIntervalValue] = useState<number>(3);
@@ -108,7 +108,6 @@ export default function Home() {
   // Quét lại phân tích học bạ khi từ khóa thay đổi
   useEffect(() => {
     if (mode === "vnedu" && vneduMethod === "auto" && files.length > 0) {
-      // Re-trigger phân tích thông minh cho các file hiện tại
       const reAnalyze = async () => {
         const updatedFiles = [...files];
         let hasChange = false;
@@ -172,7 +171,7 @@ export default function Home() {
       starts.unshift(1);
     }
 
-    // 2. Tính toán số trang của từng học sinh
+    // 2. Tính toán số trang của từng học sinh và xác định vị trí chèn trang trắng
     const sizes: number[] = [];
     const inserts: number[] = [];
 
@@ -260,7 +259,7 @@ export default function Home() {
     // Cập nhật hàng đợi hiển thị spinner
     setFiles((prev) => [...prev, ...newItems]);
 
-    // Bất đồng bộ load từng file để trích xuất số trang & quét text thông minh
+    // Bất đồng bộ load từng file để trích xuất số trang & quét chữ thông minh
     for (const item of newItems) {
       try {
         const buffer = await item.file.arrayBuffer();
@@ -269,7 +268,7 @@ export default function Home() {
         const doc = await PDFDocument.load(buffer);
         const pages = doc.getPageCount();
 
-        // 2. Chạy quét text thông minh bằng PDF.js CDN để phân tích cấu trúc học sinh
+        // 2. Chạy quét text thông minh bằng PDF.js CDN để phân tích cấu trúc học sinh dựa trên từ khóa Quê quán
         const textAnalysis = await analyzePdfText(buffer, pages, vneduKeyword);
 
         setFiles((prev) => 
@@ -287,13 +286,11 @@ export default function Home() {
           )
         );
 
-        // --- TỰ ĐỘNG GỢI Ý CẤU HÌNH TRANG CỐ ĐỊNH (PHÒNG HỜ KHI BẬT FIXED) ---
-        if (vneduMethod === "fixed") {
-          const commonPageSizes = [3, 4, 5, 6];
-          const divisors = commonPageSizes.filter((size) => pages % size === 0);
-          if (divisors.length > 0) {
-            setIntervalValue(divisors[0]);
-          }
+        // Gợi ý cấu hình trang cố định phòng hờ
+        const commonPageSizes = [3, 4, 5, 6];
+        const divisors = commonPageSizes.filter((size) => pages % size === 0);
+        if (divisors.length > 0) {
+          setIntervalValue(divisors[0]);
         }
       } catch (err: any) {
         const errMsg = err?.message || "";
@@ -666,7 +663,7 @@ export default function Home() {
                     {vneduMethod === "auto" ? (
                       /* HIỂN THỊ PHÂN TÍCH TỰ ĐỘNG QUA QUÉT CHỮ */
                       <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: "1.5" }}>
-                        <div>• Trích xuất thành công: Tìm thấy <strong>{starts.length} học sinh</strong> dựa trên từ khóa lý lịch <em>&quot;{vneduKeyword}&quot;</em>.</div>
+                        <div>• Trích xuất thành công: Tìm thấy <strong>{starts.length} học sinh</strong> dựa trên từ khóa lý lịch độc bản <em>&quot;{vneduKeyword}&quot;</em>.</div>
                         
                         {hasNhayTrang && (
                           <div style={{ margin: "0.25rem 0", color: "#fbbf24", fontWeight: 600 }}>
@@ -685,7 +682,7 @@ export default function Home() {
                               <div key={`student-${index}`} style={{ fontSize: "0.75rem", display: "flex", justifyContent: "space-between", padding: "0.15rem 0" }}>
                                 <span>Học sinh {index + 1}: Trang {startPage} &rarr; {startPage + size - 1} ({size} trang)</span>
                                 {isOdd ? (
-                                  <span style={{ color: "#fbbf24", fontWeight: 600 }}>Cần chèn +1 trang trắng</span>
+                                  <span style={{ color: "#fbbf24", fontWeight: 600 }}>Cần chèn +1 trang trắng sau trang {startPage + size - 1}</span>
                                 ) : (
                                   <span style={{ color: "var(--success)", fontWeight: 600 }}>Đã tối ưu (Chẵn trang)</span>
                                 )}
@@ -792,20 +789,21 @@ export default function Home() {
 
                   {vneduMethod === "auto" ? (
                     <div className="form-group">
-                      <label htmlFor="keyword-select">Từ khóa nhận diện trang bìa học sinh mới</label>
+                      <label htmlFor="keyword-select">Từ khóa lý lịch nhận diện học sinh mới</label>
                       <select 
                         id="keyword-select"
                         value={vneduKeyword} 
                         onChange={(e) => setVneduKeyword(e.target.value)}
                         className="input-control"
                       >
-                        <option value="Họ và tên học sinh">Họ và tên học sinh (vnEdu chuẩn)</option>
-                        <option value="Nam, nữ:">Nam, nữ: (Lý lịch học sinh)</option>
+                        <option value="Quê quán">Quê quán (Khuyên dùng - vnEdu cực chuẩn)</option>
+                        <option value="Dân tộc">Dân tộc (Mục lý lịch)</option>
+                        <option value="Nơi sinh">Nơi sinh (Mục lý lịch)</option>
+                        <option value="Ngày sinh">Ngày sinh (Mục lý lịch)</option>
                         <option value="HỌC BẠ">HỌC BẠ (Trang bìa lớn)</option>
-                        <option value="Trang 1/">Trang 1/ (Ký hiệu trang)</option>
                       </select>
                       <span className="input-help-text">
-                        Hệ thống sẽ quét từng trang PDF, trang nào có chứa từ khóa này sẽ được định vị là trang bắt đầu của một học sinh mới.
+                        Hệ thống sẽ quét từng trang PDF, trang nào có chứa từ khóa này sẽ được định vị là trang bắt đầu của một học sinh mới (Trang lý lịch).
                       </span>
                     </div>
                   ) : (
@@ -911,7 +909,7 @@ export default function Home() {
                 <div style={{ padding: "0.5rem", borderRadius: "10px", background: "rgba(16, 185, 129, 0.03)", border: "1px solid rgba(16, 185, 129, 0.1)", fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: "1.4" }}>
                   💡 <strong>Tại sao AI Auto-detect khôn hơn?</strong> <br/>
                   * Quét và đọc text thực tế của từng trang PDF. <br/>
-                  * Tự động nhận diện ranh giới từng học sinh kể cả khi có học sinh bị nhảy trang (em 3 trang, em 4 trang, em 5 trang...). <br/>
+                  * Tự động nhận diện ranh giới từng học sinh bằng từ khóa lý lịch độc bản (như Quê quán). <br/>
                   * Tự động tính chẵn lẻ của riêng học sinh đó để chèn trang trắng bù vào cuối em đó chuẩn 100%, không lo lệch in ấn hàng loạt!
                 </div>
               )}
