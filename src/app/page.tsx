@@ -26,10 +26,11 @@ interface FileItem {
   pageCount: number;
   loading: boolean;
   error: string | null;
-  // Metadata quét text thông minh
-  studentStarts: number[]; // Vị trí các trang bắt đầu của từng học sinh (1-indexed)
-  studentSizes: number[]; // Số trang của từng học sinh tương ứng
-  insertPositions: number[]; // Vị trí cần chèn trang trắng (1-indexed dựa trên file gốc)
+  // Metadata quét text thông minh nhận diện theo tên học sinh
+  studentStarts: number[]; // Vị trí trang bắt đầu của từng em (1-indexed)
+  studentSizes: number[]; // Số trang của từng em
+  studentNames: string[]; // Tên của từng em học sinh tương ứng
+  insertPositions: number[]; // Vị trí cần chèn trang trắng (1-indexed)
 }
 
 interface ProcessedResultItem {
@@ -70,8 +71,8 @@ export default function Home() {
   const [mode, setMode] = useState<"vnedu" | "interval" | "specific">("vnedu");
   
   // vnEdu Smart Settings
-  const [vneduMethod, setVneduMethod] = useState<"auto" | "fixed">("auto"); // auto: Quét từ khóa quét chữ, fixed: số trang cố định
-  const [vneduKeyword, setVneduKeyword] = useState<string>("Quê quán"); // Từ khóa nhận biết trang lý lịch đầu tiên của mỗi học sinh
+  const [vneduMethod, setVneduMethod] = useState<"auto" | "fixed">("auto"); // auto: Tự nhận diện thay đổi tên, fixed: số trang cố định
+  const [vneduKeyword, setVneduKeyword] = useState<string>("Họ và tên"); // Nhãn từ khóa nhận diện tên học sinh
   
   // Chế độ thông thường
   const [intervalValue, setIntervalValue] = useState<number>(3);
@@ -122,6 +123,7 @@ export default function Home() {
                 ...item,
                 studentStarts: analysis.starts,
                 studentSizes: analysis.sizes,
+                studentNames: analysis.names,
                 insertPositions: analysis.inserts
               };
               hasChange = true;
@@ -141,59 +143,109 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vneduKeyword, vneduMethod, mode]);
 
-  // --- Hàm quét chữ trích xuất text từng trang để tìm điểm phân chia học sinh ---
+  // --- Hàm trích xuất tên học sinh cực sạch từ dòng text vnEdu ---
+  const extractStudentName = (pageText: string, keyword: string): string => {
+    const normalized = pageText.normalize("NFC");
+    
+    // Tạo regex động dựa trên từ khóa (mặc định: Họ và tên)
+    const escapedKeyword = keyword.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&");
+    const regex = new RegExp(`(?:${escapedKeyword}(?:\\s+học\\s+sinh)?)\\s*[:\\s]\\s*([^\\n\\t,;:|]+)`, "i");
+    const match = normalized.match(regex);
+    
+    if (match && match[1]) {
+      let name = match[1].trim();
+      
+      // 1. Cắt trước chữ "Lớp:" nếu có bị gộp chung
+      const lopIndex = name.toLowerCase().indexOf("lớp");
+      if (lopIndex !== -1) {
+        name = name.substring(0, lopIndex).trim();
+      }
+      
+      // 2. Cắt trước khoảng trắng kép "  " (vnEdu dùng khoảng trống lớn để ngăn cách cột Lớp)
+      const doubleSpaceIndex = name.indexOf("  ");
+      if (doubleSpaceIndex !== -1) {
+        name = name.substring(0, doubleSpaceIndex).trim();
+      }
+      
+      // Định dạng lại khoảng trắng thừa ở giữa
+      name = name.replace(/\s+/g, " ").trim();
+      return name;
+    }
+    
+    return "";
+  };
+
+  // --- Hàm quét chữ tìm ranh giới học sinh dựa trên sự xuất hiện của từ khóa lý lịch ---
   const analyzePdfText = async (
     arrayBuffer: ArrayBuffer, 
     pageCount: number, 
     keyword: string
-  ): Promise<{ starts: number[]; sizes: number[]; inserts: number[] }> => {
+  ): Promise<{ starts: number[]; sizes: number[]; names: string[]; inserts: number[] }> => {
     const pdfjsLib = await loadPdfJS();
     
-    // Load file bằng PDF.js CDN
     const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) });
     const pdfDoc = await loadingTask.promise;
     
-    const starts: number[] = [];
+    const starts: number[] = [1]; // Học sinh đầu tiên luôn bắt đầu từ trang 1
+    const names: string[] = []; // Tên trích xuất tương ứng của từng học sinh (để hiển thị giao diện)
     
-    // 1. Quét tìm tất cả các trang chứa từ khóa
+    // Chuẩn hóa từ khóa tìm kiếm ranh giới
+    const normalizedKeyword = keyword.normalize("NFC").toLowerCase().replace(/\s+/g, " ");
+    
+    // Lưu văn bản của từng trang bắt đầu để trích xuất tên sau
+    const pageTextsAtStarts: string[] = [];
+
+    // Duyệt qua từng trang để phát hiện ranh giới học sinh dựa trên sự xuất hiện của từ khóa lý lịch
     for (let i = 1; i <= pageCount; i++) {
       const page = await pdfDoc.getPage(i);
       const textContent = await page.getTextContent();
       const pageText = textContent.items.map((item: any) => item.str).join(" ");
       
-      // CHUẨN HÓA UNICODE DỰNG SẴN (NFC) giải quyết triệt để lỗi lệch mã Tiếng Việt
-      const normalizedText = pageText.normalize("NFC").toLowerCase();
-      const normalizedKeyword = keyword.normalize("NFC").toLowerCase();
-      
-      if (normalizedText.includes(normalizedKeyword)) {
-        starts.push(i);
+      const normalizedPageText = pageText.normalize("NFC").toLowerCase().replace(/\s+/g, " ");
+
+      if (i === 1) {
+        pageTextsAtStarts.push(pageText);
+      } else {
+        // Nếu trang i chứa từ khóa lý lịch (ví dụ: "Họ và tên")
+        // Đảm bảo khoảng cách tối thiểu giữa các học sinh >= 2 trang (học bạ luôn tối thiểu 2 trang)
+        // để tránh nhiễu từ khóa bị lặp lại ngẫu nhiên ở phần nhận xét hoặc chữ ký
+        const lastStart = starts[starts.length - 1];
+        if (normalizedPageText.includes(normalizedKeyword) && (i - lastStart >= 2)) {
+          starts.push(i);
+          pageTextsAtStarts.push(pageText);
+        }
       }
     }
 
-    // Đảm bảo học sinh đầu tiên bắt đầu từ trang 1
-    if (starts.length === 0 || starts[0] !== 1) {
-      starts.unshift(1);
+    // Trích xuất tên học sinh tại các trang bắt đầu đã xác định để hiển thị thân thiện trên giao diện
+    for (let i = 0; i < starts.length; i++) {
+      const pageText = pageTextsAtStarts[i];
+      const extractedName = extractStudentName(pageText, keyword);
+      if (extractedName) {
+        names.push(extractedName);
+      } else {
+        names.push(`Học sinh ${i + 1}`);
+      }
     }
 
-    // 2. Tính toán số trang của từng học sinh và xác định vị trí chèn trang trắng
+    // 3. Tính toán số trang của từng học sinh và xác định vị trí chèn trang trắng
     const sizes: number[] = [];
     const inserts: number[] = [];
 
     for (let i = 0; i < starts.length; i++) {
       const start = starts[i];
-      // Học sinh tiếp theo bắt đầu ở starts[i+1], hoặc nếu là em cuối cùng thì kết thúc ở trang cuối pageCount
       const end = (i < starts.length - 1) ? starts[i + 1] - 1 : pageCount;
       const size = end - start + 1;
       
       sizes.push(size);
 
-      // Nếu số trang của học sinh này là số lẻ, chèn trang trắng sau trang cuối (end) của em đó
+      // Nếu số trang của em học sinh này là số lẻ, chèn trang trắng sau trang cuối (end) của em đó
       if (size % 2 !== 0) {
         inserts.push(end);
       }
     }
 
-    return { starts, sizes, inserts };
+    return { starts, sizes, names, inserts };
   };
 
   // --- Handlers ---
@@ -257,6 +309,7 @@ export default function Home() {
       error: null,
       studentStarts: [],
       studentSizes: [],
+      studentNames: [],
       insertPositions: []
     }));
 
@@ -268,11 +321,11 @@ export default function Home() {
       try {
         const buffer = await item.file.arrayBuffer();
         
-        // 1. Lấy tổng số trang bằng pdf-lib
+        // 1. Lấy tổng số trang bằng pdf-lib (nhanh nhất)
         const doc = await PDFDocument.load(buffer);
         const pages = doc.getPageCount();
 
-        // 2. Chạy quét text thông minh bằng PDF.js CDN để phân tích cấu trúc học sinh dựa trên từ khóa Quê quán
+        // 2. Chạy quét text thông minh bằng PDF.js CDN để phân tích cấu trúc học sinh dựa trên từ khóa lý lịch
         const textAnalysis = await analyzePdfText(buffer, pages, vneduKeyword);
 
         setFiles((prev) => 
@@ -283,6 +336,7 @@ export default function Home() {
                   pageCount: pages, 
                   studentStarts: textAnalysis.starts,
                   studentSizes: textAnalysis.sizes,
+                  studentNames: textAnalysis.names,
                   insertPositions: textAnalysis.inserts,
                   loading: false 
                 } 
@@ -290,7 +344,7 @@ export default function Home() {
           )
         );
 
-        // Gợi ý cấu hình trang cố định
+        // Gợi ý cấu hình trang cố định phòng hờ
         const commonPageSizes = [3, 4, 5, 6];
         const divisors = commonPageSizes.filter((size) => pages % size === 0);
         if (divisors.length > 0) {
@@ -400,12 +454,11 @@ export default function Home() {
         // --- CHẾ ĐỘ 1: vnEdu HỌC BẠ / IN 2 MẶT THÔNG MINH ---
         if (mode === "vnedu") {
           if (vneduMethod === "auto") {
-            // TỰ ĐỘNG NHẬN DIỆN CHỮ: Chèn trang trắng tại các vị trí lẻ trang đã quét được
             const insertPositions = fileItem.insertPositions;
             
-            // Xử lý Fallback: Nếu không tìm thấy bất kỳ trang phân chia nào (quét lỗi hoặc từ khóa sai)
-            if (fileItem.studentStarts.length <= 1) {
-              throw new Error(`Không quét được từ khóa "${vneduKeyword}" trong file: "${fileItem.file.name}". Vui lòng kiểm tra lại từ khóa lý lịch hoặc chuyển sang chế độ "Số trang cố định" và thực hiện lại.`);
+            // Xử lý Fallback: Nếu chỉ tìm thấy 1 học sinh duy nhất trong khi file gộp rất lớn (chứng tỏ quét ranh giới thất bại)
+            if (fileItem.studentStarts.length === 1 && fileItem.pageCount > 6) {
+              throw new Error(`Không phát hiện được ranh giới học sinh tiếp theo bằng từ khóa "${vneduKeyword}" trong file: "${fileItem.file.name}". Vui lòng kiểm tra lại từ khóa lý lịch (ví dụ: đổi sang "Họ và tên học sinh", "Quê quán"...) hoặc chuyển sang chế độ "Số trang cố định" và thực hiện lại.`);
             }
 
             if (insertPositions.length > 0) {
@@ -593,7 +646,7 @@ export default function Home() {
                         )}
                         {!fileItem.loading && !fileItem.error && (
                           <span style={{ color: "var(--success)", marginLeft: "0.5rem", fontWeight: 600 }}>
-                            • {fileItem.pageCount} trang gốc • Tìm thấy {fileItem.studentStarts.length} học sinh
+                            • {fileItem.pageCount} trang gốc • Quét được {fileItem.studentNames.length} học sinh
                           </span>
                         )}
                         {fileItem.error && (
@@ -660,6 +713,7 @@ export default function Home() {
 
                 const starts = fileItem.studentStarts;
                 const sizes = fileItem.studentSizes;
+                const names = fileItem.studentNames;
                 const inserts = fileItem.insertPositions;
                 const hasNhayTrang = sizes.some((s, i) => i > 0 && s !== sizes[0]);
 
@@ -673,16 +727,16 @@ export default function Home() {
                       /* HIỂN THỊ PHÂN TÍCH TỰ ĐỘNG QUA QUÉT CHỮ */
                       <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)", lineHeight: "1.5" }}>
                         
-                        {starts.length <= 1 ? (
+                        {(starts.length === 1 && fileItem.pageCount > 6) ? (
                           /* CẢNH BÁO KHI QUÉT THẤT BẠI - CHUYỂN DỰ PHÒNG */
                           <div style={{ color: "#f87171", padding: "0.5rem", borderRadius: "8px", background: "rgba(239, 68, 68, 0.05)", border: "1px solid rgba(239, 68, 68, 0.15)" }}>
-                            ⚠️ <strong>Quét chữ thất bại:</strong> Không tìm thấy từ khóa lý lịch <strong>&quot;{vneduKeyword}&quot;</strong> trong file PDF này. <br/>
-                            &rarr; <em>Vui lòng kiểm tra lại từ khóa hoặc chuyển sang chế độ <strong>&quot;Số trang cố định&quot;</strong> để hệ thống tự động chia đều (ví dụ: nhập 3 trang mỗi em) và chèn chính xác 100%!</em>
+                            ⚠️ <strong>Quét ranh giới thất bại:</strong> Không phát hiện được ranh giới học sinh tiếp theo bằng từ khóa lý lịch <strong>&quot;{vneduKeyword}&quot;</strong> trong file PDF này. <br/>
+                            &rarr; <em>Vui lòng kiểm tra lại từ khóa lý lịch (ví dụ: đổi sang "Họ và tên học sinh", "Quê quán"...) hoặc đơn giản chuyển sang chế độ <strong>&quot;Số trang cố định&quot;</strong> để hệ thống tự động chia đều và chèn chính xác 100%!</em>
                           </div>
                         ) : (
                           /* QUÉT THÀNH CÔNG RỰC RỠ */
                           <>
-                            <div>• Trích xuất thành công: Tìm thấy <strong>{starts.length} học sinh</strong> dựa trên từ khóa lý lịch độc bản <em>&quot;{vneduKeyword}&quot;</em>.</div>
+                            <div>• Quét chữ tự động: Phát hiện lớp có <strong>{starts.length} học sinh</strong> bằng từ khóa lý lịch.</div>
                             
                             {hasNhayTrang && (
                               <div style={{ margin: "0.25rem 0", color: "#fbbf24", fontWeight: 600 }}>
@@ -690,16 +744,17 @@ export default function Home() {
                               </div>
                             )}
 
-                            <div style={{ margin: "0.5rem 0", background: "rgba(0,0,0,0.2)", padding: "0.5rem 0.75rem", borderRadius: "8px", maxHeight: "120px", overflowY: "auto" }}>
+                            <div style={{ margin: "0.5rem 0", background: "rgba(0,0,0,0.2)", padding: "0.5rem 0.75rem", borderRadius: "8px", maxHeight: "150px", overflowY: "auto" }}>
                               <span style={{ fontSize: "0.75rem", fontWeight: 600, display: "block", marginBottom: "0.25rem", color: "var(--text-muted)" }}>
-                                Cấu trúc bù trang chi tiết:
+                                Cấu trúc bù trang chi tiết theo từng học sinh:
                               </span>
                               {starts.map((startPage, index) => {
                                 const size = sizes[index];
                                 const isOdd = size % 2 !== 0;
+                                const studentName = names[index] || `Học sinh ${index + 1}`;
                                 return (
                                   <div key={`student-${index}`} style={{ fontSize: "0.75rem", display: "flex", justifyContent: "space-between", padding: "0.15rem 0" }}>
-                                    <span>Học sinh {index + 1}: Trang {startPage} &rarr; {startPage + size - 1} ({size} trang)</span>
+                                    <span>Học sinh {index + 1}: <strong>{studentName}</strong> (Trang {startPage} &rarr; {startPage + size - 1} | {size} trang)</span>
                                     {isOdd ? (
                                       <span style={{ color: "#fbbf24", fontWeight: 600 }}>Cần chèn +1 trang trắng sau trang {startPage + size - 1}</span>
                                     ) : (
@@ -712,7 +767,7 @@ export default function Home() {
 
                             {inserts.length > 0 ? (
                               <div style={{ color: "var(--success)", fontWeight: 600 }}>
-                                ✨ Thuật toán thông minh sẽ tự động chèn thêm {inserts.length} trang trắng vào đúng vị trí cuối phần học bạ của các em bị lẻ trang (trang {inserts.join(", ")}). Đảm bảo in 2 mặt nhảy trang chính xác 100%!
+                                ✨ Thuật toán thông minh sẽ tự động chèn thêm {inserts.length} trang trắng vào đúng vị trí cuối học bạ của các em bị lẻ trang (ngay sau trang gốc {inserts.join(", ")}). Đảm bảo in 2 mặt nhảy trang chính xác 100%!
                               </div>
                             ) : (
                               <div style={{ color: "var(--success)", fontWeight: 600 }}>
@@ -810,21 +865,22 @@ export default function Home() {
 
                   {vneduMethod === "auto" ? (
                     <div className="form-group">
-                      <label htmlFor="keyword-select">Từ khóa lý lịch nhận diện học sinh mới</label>
+                      <label htmlFor="keyword-select">Từ khóa nhận diện Họ tên học sinh</label>
                       <select 
                         id="keyword-select"
                         value={vneduKeyword} 
                         onChange={(e) => setVneduKeyword(e.target.value)}
                         className="input-control"
                       >
-                        <option value="Quê quán">Quê quán (Khuyên dùng - vnEdu cực chuẩn)</option>
+                        <option value="Họ và tên">Họ và tên (Mặc định - vnEdu chuẩn)</option>
+                        <option value="Họ và tên học sinh">Họ và tên học sinh</option>
+                        <option value="Quê quán">Quê quán (Lý lịch học sinh)</option>
                         <option value="Dân tộc">Dân tộc (Mục lý lịch)</option>
                         <option value="Nơi sinh">Nơi sinh (Mục lý lịch)</option>
-                        <option value="Ngày sinh">Ngày sinh (Mục lý lịch)</option>
                         <option value="HỌC BẠ">HỌC BẠ (Trang bìa lớn)</option>
                       </select>
                       <span className="input-help-text">
-                        Hệ thống sẽ quét từng trang PDF, trang nào có chứa từ khóa này sẽ được định vị là trang bắt đầu của một học sinh mới (Trang lý lịch).
+                        Hệ thống tự động trích xuất tên học sinh nằm sau từ khóa này để so sánh sự thay đổi tên giữa các trang, tự động nhận diện ranh giới học sinh chuẩn 100%!
                       </span>
                     </div>
                   ) : (
@@ -930,7 +986,7 @@ export default function Home() {
                 <div style={{ padding: "0.5rem", borderRadius: "10px", background: "rgba(16, 185, 129, 0.03)", border: "1px solid rgba(16, 185, 129, 0.1)", fontSize: "0.8rem", color: "var(--text-secondary)", lineHeight: "1.4" }}>
                   💡 <strong>Tại sao AI Auto-detect khôn hơn?</strong> <br/>
                   * Quét và đọc text thực tế của từng trang PDF. <br/>
-                  * Tự động nhận diện ranh giới từng học sinh bằng từ khóa lý lịch độc bản (như Quê quán). <br/>
+                  * Tự động nhận diện ranh giới từng học sinh bằng từ khóa lý lịch độc bản (như Họ và tên). <br/>
                   * Tự động tính chẵn lẻ của riêng học sinh đó để chèn trang trắng bù vào cuối em đó chuẩn 100%, không lo lệch in ấn hàng loạt!
                 </div>
               )}
